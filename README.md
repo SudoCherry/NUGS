@@ -1,7 +1,7 @@
 # NUGS
 The Only Portable Syncing Software You Will Ever Need.
 
-<img width="738" height="738" alt="NUGS" src="https://github.com/user-attachments/assets/64615795-4409-41a5-9051-48a83371215e" />
+<img width="579" height="579" alt="Screenshot 2026-10-02 at 9 19 05 am" src="https://github.com/user-attachments/assets/585a29f5-10e1-44e9-a13b-364cc63009c2" />
 
 **0.0.1** — mirror a local folder onto a portable device.
 
