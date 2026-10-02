@@ -1,9 +1,8 @@
-# NUGS
-The Only Portable Syncing Software You Will Ever Need.
+# nugs
 
 <img width="579" height="579" alt="Screenshot 2026-10-02 at 9 19 05 am" src="https://github.com/user-attachments/assets/585a29f5-10e1-44e9-a13b-364cc63009c2" />
 
-**0.0.1** — mirror a local folder onto a portable device.
+**0.0.2** — mirror a local folder onto a portable device.
 
 `nugs` is a single small C program. It finds attached devices, works out what
 is missing or stale, and copies files across — one direction, and never
@@ -24,13 +23,17 @@ Two kinds of device are supported, and `nugs` picks whichever it finds:
 - [Getting started](#getting-started)
 - [Commands](#commands)
 - [How decisions are made](#how-decisions-are-made)
+- [Interrupted copies](#interrupted-copies)
 - [Deletions](#deletions)
+- [Names a FAT device cannot store](#names-a-fat-device-cannot-store) — why a
+  file is skipped instead of copied
 - [Which files get synced](#which-files-get-synced) — the `filter` setting, and
   the `palm` and `ce` modes for Palm OS and Windows CE / Pocket PC
 - [PDAs and other non-audio devices](#pdas-and-other-non-audio-devices)
 - [Notes on the two backends](#notes-on-the-two-backends)
 - [Testing](#testing)
 - [Configuration reference](#configuration-reference)
+- [Versioning](#versioning) — how `--version` and the git tags are kept in step
 - [Changelog](#changelog)
 
 ## Building
@@ -46,7 +49,7 @@ additionally needs `libmtp` and `libusb`.
 On Debian/Ubuntu, for MTP support:
 
 ```sh
-sudo apt install build-essential libmtp-dev libusb-dev
+sudo apt install build-essential libmtp-dev libusb-1.0-0-dev
 make
 ```
 
@@ -72,7 +75,7 @@ make clean
 To run it without installing, add the build directory to your `PATH`:
 
 ```sh
-ln -sf ~/Documents/NUGS/target/nugs ~/.local/bin/nugs
+ln -sf /path/to/nugs/target/nugs ~/.local/bin/nugs
 ```
 
 ## Getting started
@@ -139,6 +142,7 @@ Options:
 | `--config <file>` | use a different config file |
 | `--prune` | also delete device files that are not in the local root |
 | `--no-delete` | never even propose deletions |
+| `--force-prune` | let `--prune` empty the device folder even when the library is empty |
 | `--verify` | compare file contents, not just size and timestamp |
 | `-f, --filter <mode>` | override the filter: `audio`, `all`, `custom`, `palm` or `ce` |
 | `-n, --dry-run` | report what `sync` would do, write nothing |
@@ -192,6 +196,11 @@ within two seconds. That two-second window matters because FAT32 stores
 timestamps at two-second resolution, and a stricter comparison would re-copy
 every file on every run.
 
+A third case keeps a file off the device entirely: when its name is one FAT
+cannot hold, it is [skipped with a reason](#names-a-fat-device-cannot-store)
+rather than attempted. That is not a disagreement between two copies, and it is
+not counted as a failure.
+
 `--verify` compares actual file contents instead, and catches anything the
 timestamp shortcut misses: a truncated copy, a file edited in place without
 its timestamp changing, a device that mangles metadata. It reads every file
@@ -201,6 +210,35 @@ normal sync. Worth using when you suspect something is wrong, not every run.
 The trade-off to know about: because of that two-second window, a change made
 to a file within two seconds of its previous timestamp, with no size change,
 can be missed by a plain `sync`. Run `sync --verify` when that matters.
+
+## Interrupted copies
+
+Every file is written under a scratch name and renamed into place only once it
+is complete. A copy that is cut short — cable pulled, card yanked, player
+unplugged mid-sync — therefore leaves the destination untouched instead of a
+shortened file wearing the right name, which is the failure that matters: it
+looks fine, the next `sync` sees a size that nearly matches and skips it, and
+the track turns out to be broken much later. `pull` does the same, so a fetch
+that dies part way cannot leave a stub in your own library.
+
+The scratch name is unique per run (`track.mp3.nugs4711-0.part`), so two syncs
+at once cannot interleave their writes and rename a mixture into place. Nothing
+is renamed until its bytes have been pushed to the medium rather than just to
+the buffer, which on a USB stick is the difference between surviving an unplug
+and not.
+
+Two things are left as they are, deliberately:
+
+- A file that a run was killed mid-copy can still leave its scratch file behind,
+  since nothing is there to clean up. The name ends in `.part`, so no filter
+  picks it up as a track. `sync --prune` with `filter = all` removes it.
+- The timestamp is set after the data is flushed, and FAT players usually ignore
+  it anyway.
+
+On MTP the upload goes to a scratch name on the device and is renamed there
+afterwards, since a half-transferred object otherwise sits under the name the
+library expects. Re-syncing a changed file also removes the copy it replaces;
+it used to leave both on the device.
 
 ## Deletions
 
@@ -221,10 +259,112 @@ There is no trash on these devices, so check `plan` before you prune.
 
 Empty directories left behind by pruning are not removed.
 
+### Pruning refuses an empty library
+
+`--prune` deletes every device file the library does not have. If the library
+scan comes back with nothing in it, that means *everything* in the folder, and
+the player is usually the only other copy of that music. So `sync --prune`
+refuses in that case instead of running:
+
+```
+$ nugs sync --prune
+Device: CLIP [/media/usb/CLIP] (MSC)
+nugs: refusing to prune: /home/me/Music holds no files that pass the filter.
+      --prune would delete all 128 file(s) from 'Music' on the device.
+      Check --library and the filter (currently 'audio'). If you really do want
+      the device folder emptied, pass --force-prune.
+```
+
+An empty library is nearly always a mistake rather than an intention: the wrong
+path, a disk that is not mounted, a home directory that has never synced, or a
+filter that matches nothing on disk — a library of `.pdf` files under the
+default `audio` filter hits this too, and would otherwise cost you every track
+on the player. A library that is missing or unreadable already fails on its own
+before the device is touched.
+
+To clear a player on purpose, ask for it:
+
+```sh
+nugs sync --prune --force-prune
+```
+
+The guard only fires when files would actually be deleted, so an empty library
+and an empty device folder still sync and say nothing is to do. A plain `sync`
+without `--prune` is never blocked.
+
+It also covers `--dry-run`, which is refused in the same terms rather than
+previewing deletions that would then be turned down. A plan is meant to be
+truthful about what `sync` will do, and a preview that quietly drops the one
+condition that stops it is worse than no preview.
+
 What `--prune` is allowed to propose depends on the
 [filter](#which-files-get-synced), since the filter applies to both sides of
 the comparison. Under `filter = palm`, a `.xyz` on the device is invisible, so
 it is never a deletion candidate.
+
+## Names a FAT device cannot store
+
+The library lives on a normal disk and the player is FAT, which is much stricter.
+Your computer will happily hold `What Is It?.mp3`; the device has no way to.
+`nugs` checks every path it is about to copy and says which part of the name is
+the problem, then skips that file and gets on with the rest:
+
+```
+$ nugs sync
+Device: CLIP [/media/usb/CLIP] (MSC)
+
+Copying 4 files (38.0 MiB)
+  ! Disc 1: Bonus/CD1.wav
+      not copied: ':' cannot be stored on a FAT device
+[1/4] 100%  Radiohead/OK Computer/Airbag.mp3
+  + Radiohead/OK Computer/Airbag.mp3
+[2/4] 100%  Radiohead/OK Computer/Lucky.mp3
+  + Radiohead/OK Computer/Lucky.mp3
+  ! Radiohead/OK Computer/Sub Pop?.mp3
+      not copied: '?' cannot be stored on a FAT device
+[3/4] 100%  Radiohead/OK Computer/Subway.mp3
+  + Radiohead/OK Computer/Subway.mp3
+
+4 copied, 2 skipped
+```
+
+They are listed in the position they would have appeared in. A warning also goes
+to stderr, so a skipped file is still noticed when the output is piped
+somewhere:
+
+```
+nugs: warning: 2 file(s) left off the device, starting with:
+      Disc 1: Bonus/CD1.wav
+      ':' cannot be stored on a FAT device
+      rename the file, or drop it from the library. 'nugs plan' lists them all.
+```
+
+`nugs plan` shows the same, and `status` counts them.
+
+It is a skip, not a failure: the run still exits 0, because everything it
+*could* copy, it copied.
+
+The rules are the ones FAT actually imposes:
+
+- the characters `: ? * " < > |`, plus control characters
+- a name ending in a dot or a space, which FAT drops
+- a single path component longer than 255 characters
+
+Every component is checked, not just the filename, because one directory called
+`Disc 1: Bonus` takes every track under it with it. Spaces, dots in the middle of
+a name, and accented or non-Latin letters are all fine, and stay that way.
+
+The check is by name, before any attempt, because these names are simply not
+portable and the drivers disagree about what to do with them. Linux and Windows
+reject them outright, which makes the copy fail at the very end, after the sync
+has already reported every file before it as done. macOS's MS-DOS driver is more
+forgiving — it stores `:` and `?` exactly as given, so the file works there — but
+it refuses anything over 255 characters all the same. Rather than leave that to
+be discovered half-way through a transfer, `nugs` decides before it starts.
+
+Nothing is lost by skipping: the file stays in your library, and it is copied as
+soon as you rename it into something the device can hold. Skipped files are
+never proposed as deletions, so `--prune` is not affected.
 
 ## Which files get synced
 
@@ -355,13 +495,13 @@ anything irreversible:
 ```sh
 # 1. what is on the device?
 $ nugs devices
-MSC  /media/gabriel/Palm
+MSC  /media/usb/PALM
      free 24 MiB of 128 MiB
-     id  /media/gabriel/Palm
+     id  /media/usb/PALM
 
 # 2. what folders does it have? names vary, so ask
 $ nugs folders
-/media/gabriel/Palm (MSC) folders:
+/media/usb/PALM (MSC) folders:
   Backup
   Card
   My Documents
@@ -370,7 +510,7 @@ Sync into one of these with: nugs sync --subdir <name>
 
 # 3. what would happen? plan and dry-run never write anything
 $ nugs plan --library ~/palm/apps --subdir Card --filter palm
-Device: /media/gabriel/Palm (MSC)
+Device: /media/usb/PALM (MSC)
 copy    128.0 KiB Address.pdb
 copy    16.0 KiB Memo.pdb
 copy    64.0 KiB calc.prc
@@ -382,7 +522,7 @@ Plan: 3 to copy (208.0 KiB), 0 already in sync
 
 ```
 $ nugs sync --library ~/palm/apps --subdir Card --filter palm --dry-run
-Device: /media/gabriel/Palm (MSC)
+Device: /media/usb/PALM (MSC)
 
 Copying 3 files (208.0 KiB)
 (dry run, nothing was written)
@@ -435,10 +575,12 @@ lsblk -f                        # find the device
 udisksctl mount -b /dev/sdb1    # needs no sudo
 ```
 
-**MTP** uses libmtp. On Linux the device is normally claimed by the kernel's
-`mtphptun`/`usb-storage` driver, and libmtp needs to detach it first, which it
-can only do as root or via a udev rule. Install `libmtp` and, if transfers are
-refused, give yourself permission over the device.
+**MTP** uses libmtp. On Linux the kernel may claim the device via the
+`usb-storage`/`mtphptun` drivers before libmtp can access it. To allow MTP
+transfers, the drivers must be detached so libmtp can claim the device; this
+usually requires root privileges or a udev rule to grant permission. Install
+`libmtp` and, if transfers are refused, configure device permissions via udev
+(or run with sufficient privileges).
 
 **On macOS, MTP does not work.** The backend compiles, and the tool builds and
 runs fine, but macOS claims MTP devices before libusb can see them, so
@@ -452,14 +594,25 @@ make test
 ```
 
 The suite exercises the whole MSC backend — discovery, sync, idempotency,
-change detection, dry run, prune, `--verify`, pull, config overrides and error
-paths — against a temporary directory made to look like a mounted device. It
-also covers the file filters directly — every mode, the extension lists,
+change detection, dry run, prune, the empty-library guard, `--verify`, pull,
+safe copies, config overrides and error paths — against a temporary directory
+made to look like a mounted device.
+
+It also covers the file filters directly — every mode, the extension lists,
 `max_size`, and the aliases — using non-audio fixtures such as `.prc`, `.pdb`,
 `.cab`, `.exe`, `.dll`, `.reg` and `.cpl`. A bug in the filter is invisible to
 a suite made only of `.mp3` files, which is exactly why the audio-only tests
-would not have caught the filter work. It needs no root, no mounting and no hardware, and runs on Linux, the
-BSDs and macOS. Two environment hooks in the MSC backend make that possible:
+would not have caught the filter work.
+
+And it covers the three ways a run can be a near miss rather than a success:
+names a FAT device cannot store, which `tests/fatname.c` also asks the rule
+directly about, since APFS and HFS+ refuse a longer component themselves and so
+cannot stage the 255 character limit through a real file; unknown config keys,
+which must be reported and ignored rather than honoured; and the version, which
+must agree with the header, the tags and this file.
+
+It needs no root, no mounting and no hardware, and runs on Linux, the BSDs and
+macOS. Two environment hooks in the MSC backend make that possible:
 
 | Variable | Effect |
 | --- | --- |
@@ -504,6 +657,19 @@ expanded. Blank lines are ignored.
 | `exclude` | — | extensions never synced, in any mode |
 | `max_size` | `0` | skip anything larger; 0 means no limit |
 
+A key that is not in that table is reported and ignored, so a typo cannot pass
+unnoticed and leave a setting quietly at its default. The likely one is offered:
+
+```
+$ nugs status
+nugs: warning: ~/.config/nugs/nugsrc:3: unknown key 'fliter', did you mean 'filter'?
+nugs: warning: ~/.config/nugs/nugsrc:9: unknown key 'qqqq'.
+      known keys are: library, subdir, device, verify, filter, include, exclude, max_size
+```
+
+It stays a warning: the rest of the file is read as usual and the exit status is
+unaffected. A line with no `=` is reported too.
+
 ---
 
 ## Roadmap
@@ -517,9 +683,41 @@ expanded. Blank lines are ignored.
 
 ## Changelog
 
-Nill, First Revision
+### v0.0.2
 
-### 0.0.1
+- **Safety fix:** `sync --prune` now refuses to run when the library holds no
+  files, instead of reading that as "delete everything in that folder on the
+  device". A wrong, unmounted or filter-excluded library can no longer wipe a
+  player in one command. `--force-prune` is the deliberate opt-out, for
+  clearing a device on purpose. The guard applies to `--dry-run` too, so a
+  preview never promises deletions that would be refused.
+- Safe copies: every file is written under a scratch name and renamed into
+  place once complete, so an interrupted copy can no longer leave a truncated
+  file that looks valid. `pull` gains the same treatment, which it lacked
+  entirely. Data is flushed to the medium before the rename, and scratch names
+  are unique per run.
+- Names a FAT device cannot store are detected and skipped, with the reason
+  given, instead of being attempted and failing part-way through a sync — after
+  every earlier file has already been reported as done. Covers `: ? * " < > |`,
+  control characters, a trailing dot or space, and any single path component
+  over 255 characters. Every component is checked, so a bad directory name
+  catches the tracks under it too. Spaces, dots mid-name and accented letters
+  are unaffected. A skipped file is not a failure, is never proposed as a
+  deletion, and stays in the library to be copied once renamed.
+- An unrecognised key in `nugsrc` is reported by name and line number, with the
+  key it was probably meant suggested, instead of the line being read and
+  thrown away: `fliter = all` no longer leaves the filter at its default in
+  silence. Far enough from every key to guess, it lists them instead. Still a
+  warning, not an error.
+- `make test` now checks that `--version` agrees with `NUGS_VERSION`, that every
+  tag points at a commit that was really that version, that the header is never
+  behind an existing tag, and that this README quotes the same number.
+- MTP: a re-synced file now replaces the copy already on the device instead of
+  being uploaded alongside it.
+- Changed dependency reference from `libusb-dev` to `libusb-1.0-0-dev` in
+  installation instructions (correct package name on Debian/Ubuntu).
+
+### v0.0.1
 
 Initial release.
 
@@ -535,6 +733,26 @@ Initial release.
   and `.cpl`.
 - `exclude` now applies to `filter = all` as documented, instead of being
   silently ignored.
+
+## Versioning
+
+The version lives in one place that matters: `NUGS_VERSION` in `src/nugs.h`,
+which is what `nugs --version` prints. Tags say `vX.Y.Z`; `README.md` says the
+same twice, in the first line and as a changelog heading. Four copies is one too
+many to keep by hand, so `make test` checks that they agree:
+
+- `--version` reports the value in the header, so a binary built before a bump
+  is caught
+- every tag points at a commit whose header really was that version
+- the header is never behind a tag that exists, which is how a release ends up
+  announcing the wrong version
+- the README's two mentions match
+
+Cutting a release is therefore: bump `NUGS_VERSION` in `src/nugs.h`, write the
+changelog heading, update the first line of the README, commit, then
+`git tag vX.Y.Z`. The suite fails if any of those is left out. Nothing derives
+the version from git at build time, so a tarball builds and reports the same
+number as the repository it came from.
 
 ## Contributing
 
